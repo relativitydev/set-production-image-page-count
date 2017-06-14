@@ -1,0 +1,253 @@
+﻿<script>
+	<name>Set Production Image Page Count</name>
+	<description>This Relativity action script populates a whole number field with the production image count for documents in the selected saved search and production set. KCD_1037602. Made 2017 - modified by TSD to ensure 9.4 Production consistency.</description>
+	<category>Case Functionality</category>
+	<Version>4.1</Version>
+	<input>
+		<field id="PageCountField" name="Page Count Field:">
+			<filters>
+				<type>1</type>
+				<category>0</category>
+			</filters>
+		</field>
+		<search id="searchId" name="Saved Search:" />
+		<sql id="productionSet" name="Production Set:">
+			SELECT 
+				ID
+				,Display
+			FROM 
+			(
+				SELECT 
+					ID = 0
+					,Display = ' All'
+				UNION ALL
+				SELECT 
+					ID = ArtifactID
+					,Display = Name
+				FROM EDDSDBO.Production WITH(NOLOCK)
+			) AS T
+			ORDER BY Display
+		</sql>
+	</input>
+	<action returns="table" timeout="1200"><![CDATA[
+
+		DECLARE @SQL NVARCHAR(MAX)
+		DECLARE @ParmDefinition NVARCHAR(MAX)
+		DECLARE @error NVARCHAR(MAX)
+		DECLARE @ProductionArtifactID INT = #productionSet#
+		DECLARE @ProductionTableName NVARCHAR(MAX) = '[EDDSDBO].ProductionDocumentFile_' +CAST(@ProductionArtifactID AS NVARCHAR(MAX))
+		DECLARE @newProductionFormatVersion DECIMAL(17,3) = 9.3
+		DECLARE @lookupVersion NVARCHAR(MAX)
+		DECLARE @currentVersion DECIMAL(17,3)
+		DECLARE @productionsAppGuid AS UNIQUEIDENTIFIER = '51B19AB2-3D45-406C-A85E-F98C01B033EC'
+		DECLARE @productionsObjectGuid AS UNIQUEIDENTIFIER = '24190650-2E73-4373-B0C4-F31142CBF300'
+		DECLARE @currentProduction INT
+		
+		IF EXISTS (SELECT * FROM TEMPDB.DBO.SYSOBJECTS O WHERE O.XTYPE IN ('U') AND O.ID = OBJECT_ID(N'TEMPDB..#KCD_00048112_Documents'))
+               DROP TABLE #KCD_00048112_Documents;
+
+        IF EXISTS (SELECT * FROM TEMPDB.DBO.SYSOBJECTS O WHERE O.XTYPE IN ('U') AND O.ID = OBJECT_ID(N'TEMPDB..#KCD_00048112_Productions'))
+               DROP TABLE #KCD_00048112_Productions;
+
+        IF EXISTS (SELECT * FROM TEMPDB.DBO.SYSOBJECTS O WHERE O.XTYPE IN ('U') AND O.ID = OBJECT_ID(N'TEMPDB..#KCD_00048112_ProductionFiles'))
+               DROP TABLE #KCD_00048112_ProductionFiles;
+		
+		CREATE TABLE #KCD_00048112_Documents(
+               [ArtifactID] INT
+               ,[PageCount] INT
+        )
+
+        CREATE TABLE #KCD_00048112_Productions(
+               [ArtifactID] INT
+        )
+        
+        CREATE TABLE #KCD_00048112_ProductionFiles(
+               [ProductionArtifactID] INT
+               ,[ProducedFileID] INT
+        )
+		
+		INSERT INTO 
+			#KCD_00048112_Documents(ArtifactID)
+		SELECT
+			[Document].ArtifactID
+		#searchId#
+		
+		-- Determine if this workspaces has the version of productions with the new table format
+		SET @lookupVersion = (
+						SELECT
+							[Version]
+						FROM 
+							[EDDSDBO].[RelativityApplication] AS [RA] WITH(NOLOCK)
+						INNER JOIN
+							[EDDSDBO].[ArtifactGuid] AS [AG] WITH(NOLOCK) ON [AG].ArtifactID = [RA].ArtifactID
+						WHERE
+							[AG].ArtifactGuid = @productionsAppGuid
+						)
+		SET @lookupVersion = ISNULL(@lookupVersion, '0.0')
+		SET @currentVersion = CAST(SUBSTRING(@lookupVersion, 1, 3) AS DECIMAL(17,3))
+		
+		IF(@currentVersion >= @newProductionFormatVersion)
+			BEGIN
+				--Executed when the production app is equal to or greator than 9.3
+
+				-- Specific Production Selected
+				IF @ProductionArtifactID > 0
+					BEGIN
+						--Make sure production table exists
+						SET @ParmDefinition = N'@errorOut NVARCHAR(MAX) OUTPUT'
+						SET @SQL = N'
+								IF OBJECT_ID(''' +@ProductionTableName +N''') IS NULL
+									BEGIN
+										SET @errorOut = ''Please Ensure the selected Production is still valid''
+									END
+								ELSE
+									BEGIN
+										SET @errorOut = NULL
+									END
+						'
+						EXECUTE sp_executesql @SQL, @ParmDefinition, @errorOut = @error OUTPUT
+						
+						SET @SQL = N'
+								UPDATE 
+									#KCD_00048112_Documents 
+								SET [PageCount] = X.[PageCount]
+								FROM #KCD_00048112_Documents KCD
+									INNER JOIN
+									(
+										SELECT 
+											K.ArtifactID,
+											COUNT(F.FileID) [PageCount]
+										FROM #KCD_00048112_Documents K (NOLOCK)
+											INNER JOIN ' +@ProductionTableName +N' AS [P] WITH(NOLOCK) ON [P].DocumentArtifactID = [K].ArtifactID
+											INNER JOIN [EDDSDBO].[FILE] AS [F] WITH(NOLOCK) ON F.FileID = [P].ProducedFileID
+										GROUP BY K.ArtifactID
+									) X ON X.ArtifactID = KCD.ArtifactID 
+								'
+					END
+				ELSE
+					BEGIN
+						-- All Productions Selected
+						
+						-- Use Audit Object Table to find all productions, even the deleted ones. I do this because production Images and tables may stick around
+						INSERT INTO 
+							#KCD_00048112_Productions(ArtifactID)
+						SELECT
+							[AO].[ArtifactID]
+						FROM 
+							[EDDSDBO].[AuditObject] AS [AO] WITH(NOLOCK)
+						INNER JOIN
+							[EDDSDBO].[ObjectType] AS [OT] WITH(NOLOCK) ON [AO].ArtifactTypeID = [OT].DescriptorArtifactTypeID
+						INNER JOIN
+							[EDDSDBO].[ArtifactGuid] AS [AG] WITH(NOLOCK) ON [OT].ArtifactID = [AG].ArtifactID
+						WHERE
+							[AG].[ArtifactGuid] = @productionsObjectGuid
+			
+						-- Insert All Production files into temp production file table
+						WHILE((SELECT COUNT(*) FROM #KCD_00048112_Productions) > 0)
+							BEGIN
+								SET @currentProduction = (SELECT TOP 1 [ArtifactID] FROM #KCD_00048112_Productions)
+								SET @SQL = N'
+										IF OBJECT_ID(''EDDSDBO.ProductionDocumentFile_' +CAST(@currentProduction AS NVARCHAR(MAX)) +N''') IS NOT NULL
+											BEGIN
+												INSERT INTO
+													#KCD_00048112_ProductionFiles([ProductionArtifactID], [ProducedFileID])
+												SELECT
+													' +CAST(@currentProduction AS NVARCHAR(MAX)) +N' AS [ProductionArtifactID] 
+													,[ProducedFileID]
+												FROM
+													EDDSDBO.ProductionDocumentFile_' +CAST(@currentProduction AS NVARCHAR(MAX)) +N' WITH(NOLOCK)
+												WHERE
+													[ProducedFileID] IS NOT NULL AND
+													[ProducedFileID] NOT IN (
+														SELECT
+															[ProducedFileID]
+														FROM
+															#KCD_00048112_ProductionFiles
+													)
+											END
+								'
+								EXECUTE sp_executesql @SQL
+								DELETE FROM #KCD_00048112_Productions WHERE [ArtifactID] = @currentProduction
+							END
+			
+						SET @SQL = N'
+								UPDATE 
+									#KCD_00048112_Documents 
+								SET [PageCount] = X.[PageCount]
+								FROM #KCD_00048112_Documents  KCD
+									INNER JOIN
+									(
+										SELECT 
+											K.ArtifactID,
+											COUNT(F.FileID)/COUNT(DISTINCT [PF].ProductionArtifactID) [PageCount]
+										FROM #KCD_00048112_Documents K (NOLOCK)
+											INNER JOIN [EDDSDBO].[FILE] F WITH(NOLOCK) ON K.ArtifactID = F.DocumentArtifactID
+											INNER JOIN #KCD_00048112_ProductionFiles AS [PF] ON [PF].[ProducedFileID] = [F].[FileID]
+										WHERE 
+											[F].Type = 3 --Production Images  
+										GROUP BY K.ArtifactID
+									) X ON X.ArtifactID = KCD.ArtifactID 
+								'
+					END
+			END
+		ELSE
+			BEGIN
+				--This is for older prodcution format before 9.3
+				SET @SQL = N'
+				UPDATE #KCD_00048112_Documents 
+				SET [PageCount] = X.[PageCount]
+				FROM #KCD_00048112_Documents  KCD
+					INNER JOIN
+					(
+						SELECT 
+							K.ArtifactID,
+							COUNT(P.ImageGuid)/COUNT(DISTINCT ProductionArtifactID) [PageCount]
+						FROM #KCD_00048112_Documents K (NOLOCK)
+							INNER JOIN ProductionDocumentFile P (NOLOCK) ON K.ArtifactID = P.DocumentArtifactID
+						' IF #productionSet# > 0 BEGIN SET @SQL = @SQL + N' 
+						WHERE P.[ProductionArtifactID] = #productionSet# ' END 
+						SET @SQL = @SQL + N'
+						GROUP BY K.ArtifactID
+					) X ON X.ArtifactID = KCD.ArtifactID 
+				'
+			END
+		
+		IF @error IS NULL
+				BEGIN
+					-- Execute SQL from above
+					EXEC(@SQL)
+					
+					-- Update and present results
+					UPDATE
+						[EDDSDBO].DOCUMENT
+					SET
+						[#PageCountField#] = [KCD].PageCount
+					OUTPUT
+						[A].TextIdentifier AS [Updated Documents]
+					FROM
+						[EDDSDBO].DOCUMENT AS [D] WITH(NOLOCK)
+					INNER JOIN
+						#KCD_00048112_Documents AS [KCD] ON [KCD].ArtifactID = [D].ArtifactID
+					INNER JOIN
+						[EDDSDBO].Artifact AS [A] WITH(NOLOCK) ON [KCD].ArtifactID = [A].ArtifactID
+					WHERE
+						[KCD].PageCount IS NOT NULL
+		
+				END
+		ELSE
+			BEGIN
+				-- Display Error
+				SELECT @error AS [Error]
+			END
+		
+		IF EXISTS (SELECT * FROM TEMPDB.DBO.SYSOBJECTS O WHERE O.XTYPE IN ('U') AND O.ID = OBJECT_ID(N'TEMPDB..#KCD_00048112_Documents'))
+       DROP TABLE #KCD_00048112_Documents;
+
+		IF EXISTS (SELECT * FROM TEMPDB.DBO.SYSOBJECTS O WHERE O.XTYPE IN ('U') AND O.ID = OBJECT_ID(N'TEMPDB..#KCD_00048112_Productions'))
+       DROP TABLE #KCD_00048112_Productions;
+
+		IF EXISTS (SELECT * FROM TEMPDB.DBO.SYSOBJECTS O WHERE O.XTYPE IN ('U') AND O.ID = OBJECT_ID(N'TEMPDB..#KCD_00048112_ProductionFiles'))
+       DROP TABLE #KCD_00048112_ProductionFiles;
+
+	]]></action>
+</script>
